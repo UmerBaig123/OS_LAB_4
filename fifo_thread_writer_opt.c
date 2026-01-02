@@ -1,10 +1,13 @@
 // ...existing code...
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <sys/types.h>
 
 // Message structure for the queue
 typedef struct {
@@ -14,26 +17,20 @@ typedef struct {
     struct timespec timestamp;
 } message_t;
 
-// Unbounded queue node structure
+// Unbounded queue node structure with atomic next pointer
 typedef struct queue_node {
     message_t* message;
-    struct queue_node* next;
+    _Atomic(struct queue_node*) next;
 } queue_node_t;
-// Add queue size limit and condition variables
-#define MAX_QUEUE_SIZE 10000  // Limit queue size to prevent memory explosion
- 
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-// Update the queue structure
+
+// Lock-free queue structure using atomic operations
 typedef struct {
-    queue_node_t* head;
-    queue_node_t* tail;
-    int size;
-    pthread_cond_t not_empty;  // Signal when queue has messages
-    pthread_cond_t not_full;   // Signal when queue has space
+    _Atomic(queue_node_t*) head;
+    _Atomic(queue_node_t*) tail;
+    _Atomic(long) size;
 } unbounded_queue_t;
 
-unbounded_queue_t message_queue = {NULL, NULL, 0, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+unbounded_queue_t message_queue = {NULL, NULL, 0};
 
 // Helper function to get current timestamp as formatted string
 void get_current_time_str(char* buffer, size_t buffer_size) {
@@ -50,13 +47,6 @@ void get_current_time_str(char* buffer, size_t buffer_size) {
 }
 
 void push_to_queue(int thread_id, int iteration, const char* content) {
-    pthread_mutex_lock(&queue_mutex);
-    
-    // Wait if queue is full (backpressure)
-    while (message_queue.size >= MAX_QUEUE_SIZE) {
-        pthread_cond_wait(&message_queue.not_full, &queue_mutex);
-    }
-    
     // Create new message
     message_t* msg = malloc(sizeof(message_t));
     msg->thread_id = thread_id;
@@ -68,55 +58,68 @@ void push_to_queue(int thread_id, int iteration, const char* content) {
     // Create new queue node
     queue_node_t* new_node = malloc(sizeof(queue_node_t));
     new_node->message = msg;
-    new_node->next = NULL;
+    atomic_store(&new_node->next, NULL);
     
-    // Add to queue (enqueue at tail)
-    if (message_queue.tail == NULL) {
-        message_queue.head = new_node;
-        message_queue.tail = new_node;
-    } else {
-        message_queue.tail->next = new_node;
-        message_queue.tail = new_node;
+    // Lock-free enqueue: append to tail using compare-and-swap
+    queue_node_t* old_tail;
+    while (1) {
+        old_tail = atomic_load(&message_queue.tail);
+        
+        // If tail is NULL, try to set it to new_node (empty queue case)
+        if (old_tail == NULL) {
+            if (atomic_compare_exchange_strong(&message_queue.head, &(queue_node_t*){NULL}, new_node)) {
+                atomic_store(&message_queue.tail, new_node);
+                atomic_fetch_add(&message_queue.size, 1);
+                return;
+            }
+        } else {
+            // Try to link new_node to the end
+            queue_node_t* null_ptr = NULL;
+            if (atomic_compare_exchange_strong(&old_tail->next, &null_ptr, new_node)) {
+                // Successfully linked, now update tail
+                atomic_compare_exchange_strong(&message_queue.tail, &old_tail, new_node);
+                atomic_fetch_add(&message_queue.size, 1);
+                return;
+            }
+        }
+        // Retry if CAS failed
     }
-    
-    message_queue.size++;
-    
-    // Signal that queue is not empty
-    pthread_cond_signal(&message_queue.not_empty);
-    
-    pthread_mutex_unlock(&queue_mutex);
 }
 
 message_t* pop_from_queue() {
     message_t* msg = NULL;
-    pthread_mutex_lock(&queue_mutex);
+    queue_node_t* old_head;
     
-    // Wait for messages instead of busy waiting
-    while (message_queue.head == NULL) {
-        pthread_cond_wait(&message_queue.not_empty, &queue_mutex);
+    // Lock-free dequeue using compare-and-swap
+    while (1) {
+        old_head = atomic_load(&message_queue.head);
+        
+        // Wait if queue is empty (spin-wait with backoff)
+        if (old_head == NULL) {
+            // Small backoff to reduce CPU spinning
+            usleep(1);
+            continue;
+        }
+        
+        // Try to move head to next node
+        queue_node_t* next = atomic_load(&old_head->next);
+        
+        if (atomic_compare_exchange_strong(&message_queue.head, &old_head, next)) {
+            // Successfully dequeued
+            msg = old_head->message;
+            atomic_fetch_sub(&message_queue.size, 1);
+            
+            // If queue becomes empty, update tail
+            if (next == NULL) {
+                queue_node_t* expected_tail = old_head;
+                atomic_compare_exchange_strong(&message_queue.tail, &expected_tail, NULL);
+            }
+            
+            free(old_head);
+            return msg;
+        }
+        // Retry if CAS failed
     }
-    
-    // Queue has messages
-    queue_node_t* node_to_remove = message_queue.head;
-    msg = node_to_remove->message;
-    
-    // Move head to next node
-    message_queue.head = message_queue.head->next;
-    
-    // If queue becomes empty, update tail too
-    if (message_queue.head == NULL) {
-        message_queue.tail = NULL;
-    }
-    
-    message_queue.size--;
-    
-    // Signal that queue has space
-    pthread_cond_signal(&message_queue.not_full);
-    
-    free(node_to_remove);
-    
-    pthread_mutex_unlock(&queue_mutex);
-    return msg;
 }
 
 void* write_files_with_rate(void* arg) {
@@ -199,8 +202,8 @@ void* file_writer_thread(void* arg) {
             
             char current_time_str[64];
             get_current_time_str(current_time_str, sizeof(current_time_str));
-            printf("%s File writer: Wrote %d messages - Queue size: %d\n", 
-                   current_time_str, messages_written, message_queue.size);
+            printf("%s File writer: Wrote %d messages - Queue size: %ld\n", 
+                   current_time_str, messages_written, atomic_load(&message_queue.size));
         }
         
         free(msg);
